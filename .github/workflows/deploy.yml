@@ -1,0 +1,104 @@
+name: SIS-3 CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "136282784702"
+  ECR_REPOSITORY: sis3-support-tickets
+  STACK_NAME: sis3-main
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install cfn-lint
+
+      - name: Test Python application
+        run: |
+          python -m py_compile app.py
+          echo "Python syntax check passed"
+
+      - name: Validate CloudFormation template
+        run: cfn-lint template.yaml
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::136282784702:role/sis3-github-actions-deploy-role
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login \
+              --username AWS \
+              --password-stdin \
+              $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build Docker image
+        run: |
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$GITHUB_SHA
+          docker build -t $IMAGE_URI .
+
+      - name: Test Docker image
+        run: |
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$GITHUB_SHA
+          docker run --rm $IMAGE_URI python -m py_compile /app/app.py
+          echo "Docker image test passed"
+
+      - name: Push image to ECR
+        run: |
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$GITHUB_SHA
+          docker push $IMAGE_URI
+
+      - name: Deploy to ECS using CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name $STACK_NAME \
+            --template-file template.yaml \
+            --parameter-overrides \
+              Environment=dev \
+              ImageTag=$GITHUB_SHA \
+              DesiredCount=1 \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --region $AWS_REGION
+
+      - name: Wait for ECS services
+        run: |
+          aws ecs wait services-stable \
+            --cluster sis3-main-cluster \
+            --services sis3-main-api sis3-main-worker \
+            --region $AWS_REGION
+
+      - name: API health check
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)
+
+          echo "Checking API: $API_URL/health"
+          curl --fail --retry 10 --retry-delay 10 \
+            "$API_URL/health"
