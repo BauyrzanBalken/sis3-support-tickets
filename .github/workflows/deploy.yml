@@ -69,7 +69,15 @@ jobs:
       - name: Push image to ECR
         run: |
           IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$GITHUB_SHA
-          docker push $IMAGE_URI
+
+          if aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Image already exists. Skipping push."
+          else
+            docker push "$IMAGE_URI"
+          fi
 
       - name: Deploy to ECS using CloudFormation
         run: |
